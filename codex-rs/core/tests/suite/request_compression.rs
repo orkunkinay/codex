@@ -286,3 +286,96 @@ async fn rejected_image_continuation_survives_failure_and_resume() -> anyhow::Re
     resumed.codex.shutdown_and_wait().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encoding_recovery_preserves_compaction_checkpoint_on_resume() -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    use codex_protocol::protocol::Op;
+    use core_test_support::responses::received_responses_requests;
+    use serde_json::Value;
+    use serde_json::json;
+    use wiremock::Mock;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path_regex;
+
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(|request: &wiremock::Request| {
+            if request.headers.contains_key("content-encoding") {
+                return ResponseTemplate::new(400).set_body_json(json!({"detail":"Bad Request"}));
+            }
+            let body: Value = serde_json::from_slice(&request.body).expect("valid request JSON");
+            let compacting = body["input"]
+                .as_array()
+                .expect("request input")
+                .iter()
+                .any(|item| item["type"] == "compaction_trigger");
+            let mut events = vec![ev_response_created("accepted")];
+            if compacting {
+                events.push(json!({
+                    "type":"response.output_item.done",
+                    "item":{"type":"compaction","encrypted_content":"PRESERVED_CHECKPOINT"}
+                }));
+            }
+            events.push(ev_completed("accepted"));
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse(events))
+        })
+        .mount(&server)
+        .await;
+    let base_url = format!("{}/backend-api/codex/v1", server.uri());
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::EnableRequestCompression)
+                .expect("enable compression");
+            config.model_provider.base_url = Some(base_url);
+            config.model_provider.supports_websockets = false;
+        });
+    let test = builder.build(&server).await?;
+    test.submit_turn("Retain decision GAMMA across compaction")
+        .await?;
+    test.codex.submit(Op::Compact).await?;
+    let completed = wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(matches!(completed, EventMsg::TurnComplete(turn) if turn.error.is_none()));
+    let resumed = builder.restart(&server, &test).await?;
+    assert_eq!(
+        resumed.session_configured.thread_id,
+        test.session_configured.thread_id
+    );
+    resumed
+        .submit_turn("Continue from the retained checkpoint")
+        .await?;
+
+    let requests = received_responses_requests(&server).await;
+    assert_eq!(requests.len(), 6);
+    for pair in requests.chunks_exact(2) {
+        assert_eq!(pair[0].header("content-encoding").as_deref(), Some("zstd"));
+        assert!(pair[1].header("content-encoding").is_none());
+        assert_eq!(
+            zstd::stream::decode_all(pair[0].body_bytes().as_slice())?,
+            pair[1].body_bytes()
+        );
+    }
+    assert_eq!(requests[3].inputs_of_type("compaction_trigger").len(), 1);
+    assert_eq!(
+        requests[5].inputs_of_type("compaction")[0]["encrypted_content"],
+        "PRESERVED_CHECKPOINT"
+    );
+    assert!(requests[5].body_contains_text("Retain decision GAMMA across compaction"));
+    assert!(requests[5].body_contains_text("Continue from the retained checkpoint"));
+    resumed.codex.shutdown_and_wait().await?;
+    Ok(())
+}
