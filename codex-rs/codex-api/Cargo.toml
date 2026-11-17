@@ -41,6 +41,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-test = { workspace = true }
 wiremock = { workspace = true }
+zstd = { workspace = true }
 
 [lints]
 workspace = true
