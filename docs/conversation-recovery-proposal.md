@@ -4,9 +4,10 @@ Suggested title: **Retry rejected compressed Responses requests with identical
 uncompressed JSON, preserving the existing conversation**
 
 The current [contribution policy](contributing.md) excludes external code
-contributions and PRs. This local patch series is prepared as supporting evidence
-for an issue discussion or public fork. Nothing has been pushed, published, or
-submitted to the maintainers.
+contributions and PRs. This patch series is published in the
+[public fork](https://github.com/orkunkinay/codex/tree/fix/resilient-compressed-conversations)
+as supporting evidence for the discussion in
+[#60594](https://github.com/openai/codex/issues/60594).
 
 ## Proposed issue text
 
