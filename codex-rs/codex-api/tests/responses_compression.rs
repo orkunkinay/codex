@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! Fault injection for a receiver that rejects valid compressed conversation replay.
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -52,7 +54,10 @@ impl HttpTransport for RejectCompressed {
 
     async fn stream(&self, request: Request) -> Result<StreamResponse, TransportError> {
         let compressed = request.headers.contains_key(http::header::CONTENT_ENCODING);
-        self.requests.lock().unwrap().push(request);
+        self.requests
+            .lock()
+            .expect("test mutex should not be poisoned")
+            .push(request);
         if self.disconnect {
             return Err(TransportError::Network("connection lost".into()));
         }
@@ -148,7 +153,10 @@ async fn compressed_replay_rejection_preserves_exact_history() -> anyhow::Result
         }
     }
     assert_eq!(completed, 1);
-    let requests = transport.requests.lock().unwrap();
+    let requests = transport
+        .requests
+        .lock()
+        .expect("test mutex should not be poisoned");
     assert_eq!(requests.len(), 2);
     let compressed = requests[0]
         .prepare_body_for_send()
@@ -220,8 +228,18 @@ async fn encoding_rejections_retry_once_but_detailed_errors_do_not() {
         };
         assert_eq!(actual_status, status);
         assert_eq!(actual_body.as_deref(), Some(body));
-        assert_eq!(headers.unwrap()["x-request-id"], "rejection-id");
-        assert_eq!(transport.requests.lock().unwrap().len(), attempts);
+        assert_eq!(
+            headers.expect("error should retain headers")["x-request-id"],
+            "rejection-id"
+        );
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .expect("test mutex should not be poisoned")
+                .len(),
+            attempts
+        );
     }
 }
 
@@ -238,7 +256,14 @@ async fn uncompressed_rejection_does_not_retry() {
             .await
             .is_err()
     );
-    assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        transport
+            .requests
+            .lock()
+            .expect("test mutex should not be poisoned")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -254,7 +279,14 @@ async fn ambiguous_disconnect_does_not_change_encoding() {
             .await
             .is_err()
     );
-    assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        transport
+            .requests
+            .lock()
+            .expect("test mutex should not be poisoned")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -272,7 +304,14 @@ async fn accepted_stream_failure_does_not_replay_request() -> anyhow::Result<()>
         errors += usize::from(event.is_err());
     }
     assert_eq!(errors, 1);
-    assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        transport
+            .requests
+            .lock()
+            .expect("test mutex should not be poisoned")
+            .len(),
+        1
+    );
     Ok(())
 }
 
@@ -291,7 +330,13 @@ async fn compression_build_failure_does_not_dispatch_or_retry() {
         result,
         Err(codex_api::ApiError::Transport(TransportError::Build(_)))
     ));
-    assert!(transport.requests.lock().unwrap().is_empty());
+    assert!(
+        transport
+            .requests
+            .lock()
+            .expect("test mutex should not be poisoned")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -300,12 +345,15 @@ async fn recovery_preserves_large_repetitive_and_compacted_payloads() -> anyhow:
     // histories. These are receiver fault-injection cases, not backend limit claims.
     for size in [0, 131_071, 131_072, 131_073, 140_000, 2_000_000] {
         let mut body = history();
-        body["input"].as_array_mut().unwrap().insert(
-            0,
-            json!({
-                "type":"compaction", "encrypted_content":"opaque-checkpoint"
-            }),
-        );
+        body["input"]
+            .as_array_mut()
+            .expect("fixture input should be an array")
+            .insert(
+                0,
+                json!({
+                    "type":"compaction", "encrypted_content":"opaque-checkpoint"
+                }),
+            );
         body["instructions"] = json!("a".repeat(size));
         let expected = serde_json::to_vec(&body)?;
         let transport = RejectCompressed::default();
@@ -313,7 +361,10 @@ async fn recovery_preserves_large_repetitive_and_compacted_payloads() -> anyhow:
         let _stream = client
             .stream(body, HeaderMap::new(), Compression::Zstd, None)
             .await?;
-        let requests = transport.requests.lock().unwrap();
+        let requests = transport
+            .requests
+            .lock()
+            .expect("test mutex should not be poisoned");
         assert_eq!(requests.len(), 2);
         for request in requests.iter() {
             let prepared = request
@@ -370,7 +421,10 @@ async fn recovery_crosses_the_real_http_error_boundary() -> anyhow::Result<()> {
         completed += usize::from(matches!(event?, ResponseEvent::Completed { .. }));
     }
     assert_eq!(completed, 1);
-    let requests = server.received_requests().await.unwrap();
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded");
     assert_eq!(requests.len(), 2);
     assert_eq!(
         zstd::stream::decode_all(requests[0].body.as_slice())?,
@@ -396,12 +450,19 @@ impl AuthProvider for SigningAuth {
                 .prepare_body_for_send()
                 .map_err(AuthError::Build)?
                 .body_bytes();
-            self.signed.lock().unwrap().push(bytes.to_vec());
+            self.signed
+                .lock()
+                .expect("test mutex should not be poisoned")
+                .push(bytes.to_vec());
             // A stand-in for a body-dependent signature; authentication must see
             // each prepared representation, rather than reusing the first signature.
             request.headers.insert(
                 "x-test-signed-length",
-                bytes.len().to_string().parse().unwrap(),
+                bytes
+                    .len()
+                    .to_string()
+                    .parse()
+                    .expect("length should be a valid header"),
             );
             Ok(request)
         })
@@ -426,8 +487,14 @@ async fn fallback_is_reauthenticated_with_final_wire_bytes() -> anyhow::Result<(
     let _stream = client
         .stream(history(), headers, Compression::Zstd, None)
         .await?;
-    let requests = transport.requests.lock().unwrap();
-    let signed = auth.signed.lock().unwrap();
+    let requests = transport
+        .requests
+        .lock()
+        .expect("test mutex should not be poisoned");
+    let signed = auth
+        .signed
+        .lock()
+        .expect("test mutex should not be poisoned");
     assert_eq!(signed.len(), 2);
     for (request, signed_bytes) in requests.iter().zip(signed.iter()) {
         let prepared = request
