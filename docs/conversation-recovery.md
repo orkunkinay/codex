@@ -128,7 +128,9 @@ The core integration regression in `core/tests/suite/request_compression.rs`
 drives a real image tool, rejects its continuation, persists and restarts the same
 thread, then recovers with identity encoding. It checks thread identity, retained
 attachment and tool-result images, the original user decision, exact fallback
-bytes, and a single image-tool execution across the restart.
+bytes, and a single image-tool execution across the restart. A second core test
+recovers remote compaction, resumes its persisted checkpoint, and verifies the
+checkpoint and retained user decision in the next recovered request.
 
 Commands from `codex-rs`:
 

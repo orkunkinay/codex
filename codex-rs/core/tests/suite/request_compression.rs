@@ -198,7 +198,7 @@ async fn rejected_image_continuation_survives_failure_and_resume() -> anyhow::Re
     assert_eq!(views, 1);
 
     // Recover the original persisted thread, including the completed tool result.
-    // The second process must not need to execute view_image again.
+    // The restarted session must not need to execute view_image again.
     reject_identity.store(false, Ordering::SeqCst);
     let resumed = builder.restart(&server, &test).await?;
     assert_eq!(
