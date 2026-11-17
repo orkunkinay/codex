@@ -14,10 +14,13 @@ use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
 use codex_client::RequestCompression;
 use codex_client::RequestTelemetry;
+use codex_client::StreamResponse;
+use codex_client::TransportError;
 use codex_protocol::protocol::SessionSource;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::Method;
+use http::StatusCode;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -139,13 +142,45 @@ impl<T: HttpTransport> ResponsesClient<T> {
         compression: Compression,
         turn_state: Option<Arc<OnceLock<String>>>,
     ) -> Result<ResponseStream, ApiError> {
+        // Keep the serialized conversation separate from its wire representation. Some
+        // receivers reject valid zstd frames with an opaque 400. Rebuilding history or
+        // rerunning a turn cannot repair that encoding and could repeat completed tools.
+        let response = self
+            .open_stream(body.clone(), extra_headers.clone(), compression)
+            .await;
+        let stream_response = match response {
+            Err(error)
+                if compression == Compression::Zstd && can_retry_without_compression(&error) =>
+            {
+                tracing::warn!(
+                    "Compressed Responses request rejected before streaming; retrying identical JSON once without compression"
+                );
+                self.open_stream(body, extra_headers, Compression::None)
+                    .await?
+            }
+            response => response?,
+        };
+
+        Ok(spawn_response_stream(
+            stream_response,
+            self.session.provider().stream_idle_timeout,
+            self.sse_telemetry.clone(),
+            turn_state,
+        ))
+    }
+
+    async fn open_stream(
+        &self,
+        body: EncodedJsonBody,
+        extra_headers: HeaderMap,
+        compression: Compression,
+    ) -> Result<StreamResponse, ApiError> {
         let request_compression = match compression {
             Compression::None => RequestCompression::None,
             Compression::Zstd => RequestCompression::Zstd,
         };
 
-        let stream_response = self
-            .session
+        self.session
             .stream_encoded_json_with(
                 Method::POST,
                 "/responses",
@@ -159,13 +194,29 @@ impl<T: HttpTransport> ResponsesClient<T> {
                     req.compression = request_compression;
                 },
             )
-            .await?;
+            .await
+    }
+}
 
-        Ok(spawn_response_stream(
-            stream_response,
-            self.session.provider().stream_idle_timeout,
-            self.sse_telemetry.clone(),
-            turn_state,
-        ))
+/// Only explicit request rejections qualify. Disconnects and errors inside an
+/// opened stream have ambiguous execution status and must not take this path.
+fn can_retry_without_compression(error: &ApiError) -> bool {
+    let ApiError::Transport(TransportError::Http { status, body, .. }) = error else {
+        return false;
+    };
+    match *status {
+        StatusCode::UNSUPPORTED_MEDIA_TYPE | StatusCode::PAYLOAD_TOO_LARGE => true,
+        StatusCode::BAD_REQUEST => body
+            .as_deref()
+            .and_then(|body| serde_json::from_str::<Value>(body).ok())
+            .is_some_and(|body| {
+                // Preserve detailed validation and policy errors rather than treating
+                // every 400 as an encoding problem.
+                body.as_object().is_some_and(|object| {
+                    object.len() == 1
+                        && object.get("detail").and_then(Value::as_str) == Some("Bad Request")
+                })
+            }),
+        _ => false,
     }
 }
